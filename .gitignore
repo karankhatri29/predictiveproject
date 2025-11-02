@@ -1,0 +1,19 @@
+# Ignore all PyTorch model files
+*.pth
+
+# Ignore all Python pickle files
+*.pkl
+
+# Ignore the Python cache directory
+__pycache__/
+
+# Ignore specific non-Python files shown in the image
+hlstm_model_safe.pth
+synthetic_emails_10k_paragraphs.txt
+
+# OPTIONAL: Ignore compiled Python files (if you see them)
+*.pyc
+
+# OPTIONAL: Ignore any temporary or log files you might generate
+*.log
+*~
