@@ -9,11 +9,21 @@ import matplotlib.pyplot as plt
 import numpy as np
 from sklearn.metrics import accuracy_score
 import nltk, time, random, math,psutil, numpy as np, pandas as pd
-
+import pickle
+import tensorflow as tf
+from tensorflow.keras.models import load_model
+from keras.initializers import Orthogonal
+import re
+from tensorflow.keras.preprocessing.sequence import pad_sequences
 
 nltk.download('punkt', quiet=True)
 
 DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+def clean_input_text(text):
+    text = text.lower()
+    text = re.sub(r'[^a-z\s]', ' ', text)
+    return [word for word in text.split() if word]
 
 # -----------------------------
 # Load Models
@@ -47,6 +57,104 @@ def load_ngram_model():
 def load_markov_model():
     with open('markov_email_model.pkl', 'rb') as f:
         return pickle.load(f)
+
+@st.cache_resource
+def load_unigram_model():
+    with open('unigram_model.pkl', 'rb') as f:
+        return pickle.load(f)
+
+MODEL_PATH = "word_predictor_model.keras"
+MAPPINGS_PATH = "gru_mappings.pkl"
+
+# @st.cache_resource
+def load_gru_model():
+    """
+    Loads the trained GRU Keras model (.keras format) and the associated vocabulary mappings.
+    
+    Returns:
+        tuple: (gru_model, word_to_index, index_to_word, sequence_length)
+    """
+    try:
+        # --- 1. Load the GRU model (.keras format) safely ---
+        gru_model = load_model(
+            MODEL_PATH,
+            custom_objects={"Orthogonal": Orthogonal},  # handle possible legacy serialization
+            compile=False
+        )
+
+        # --- 2. Load vocabulary mappings ---
+        with open(MAPPINGS_PATH, "rb") as f:
+            word_to_index, index_to_word, sequence_length = pickle.load(f)
+
+        st.success(f"✅ GRU model and mappings loaded successfully. Vocab size: {len(word_to_index)}")
+        return gru_model, word_to_index, index_to_word, sequence_length
+
+    except FileNotFoundError:
+        st.error(f"❌ Required file not found. Ensure both '{MODEL_PATH}' and '{MAPPINGS_PATH}' exist.")
+        raise
+    except Exception as e:
+        st.error(f"⚠️ An unexpected error occurred during model loading: {e}")
+        raise
+# GRU Model
+
+def predict_gru_next_words(gru_model, word_to_index, index_to_word, sequence_length, prev_sentence, curr_prefix, num_words=5):
+    """
+    Predicts the next sequence of words using the GRU model based on the combined context.
+
+    The model uses the last 'sequence_length' words of the combined text (prev_sentence + curr_prefix)
+    as the seed sequence for prediction.
+    """
+    
+    # 1. Combine previous sentence (context) and current prefix
+    full_prefix = (prev_sentence + " " + curr_prefix).strip()
+    
+    token_list = clean_input_text(full_prefix)
+    
+    if not token_list:
+        return "ERROR: Seed text is empty or contains no recognized words."
+
+    # 2. Get the last 'sequence_length' words to form the initial prediction sequence
+    # This is the sequence the model was trained on
+    current_sequence = token_list[-sequence_length:]
+    
+    generated_words = []
+
+    for _ in range(num_words):
+        
+        try:
+            # 3. Convert word sequence to numerical indices
+            indexed_sequence = [word_to_index[word] for word in current_sequence]
+        except KeyError:
+            # Prediction stops if an unknown word is encountered in the sequence
+            break
+            
+        # Keras models expect batch input: shape (1, sequence_length)
+        input_array = np.array([indexed_sequence])
+
+        # 4. Predict probabilities of the next word
+        # verbose=0 suppresses the output from the predict call
+        predicted_probs = gru_model.predict(input_array, verbose=0)[0]
+        
+        # 5. Apply temperature for sampling (modifies probability distribution)
+        if temperature != 1.0:
+            # Softening (temp > 1) or sharpening (temp < 1) the distribution
+            predicted_probs = np.log(predicted_probs) / temperature
+            predicted_probs = np.exp(predicted_probs) / np.sum(np.exp(predicted_probs))
+        
+        # 6. Choose the next word index based on the adjusted probabilities
+        # p=predicted_probs ensures sampling is based on the model's likelihood
+        next_index = np.random.choice(len(predicted_probs), p=predicted_probs)
+        
+        # 7. Look up the word
+        next_word = index_to_word.get(next_index, "<UNK>")
+        
+        generated_words.append(next_word)
+        
+        # 8. Update the sequence for the next prediction step (sliding window)
+        current_sequence = current_sequence[1:] + [next_word]
+
+    # Return only the newly predicted words, ready to be appended to the user's input
+    return " ".join(generated_words)
 
 # -----------------------------
 # HLSTM Prediction
@@ -383,6 +491,42 @@ def evaluate_model(model_name, predict_fn, model, vocab=None, test_data=None, n_
         "Words Predicted": predicted_sentences
     }
 
+# ----------- UNIgram ---------
+
+UniGRAM_N = 1
+
+def predict_unigram_next_words(ngram_model, prev_sentence, curr_prefix, max_pred=5, debug=True):
+    # Combine context + prefix
+    full_prefix = (prev_sentence + " " + curr_prefix).strip().lower()
+    tokens = nltk.word_tokenize(full_prefix)
+    outputs = []
+
+    for step in range(max_pred):
+        prefix = tuple(tokens[-(UniGRAM_N-1):]) if len(tokens) >= (UniGRAM_N-1) else tuple(tokens)
+        next_words = ngram_model.get(prefix)
+
+        if debug:
+            print(f"Step {step+1}:")
+            print(f"  Current tokens: {tokens}")
+            print(f"  Using prefix: {prefix}")
+            print(f"  Next words found: {next_words}")
+
+        if not next_words:
+            # fallback: pick a random existing prefix
+            prefix = random.choice(list(ngram_model.keys()))
+            next_words = ngram_model[prefix]
+            if debug:
+                print(f"  Prefix not found, fallback to random prefix: {prefix}")
+
+        next_word = next_words.most_common(1)[0][0]
+        outputs.append(next_word)
+        tokens.append(next_word)
+
+        if debug:
+            print(f"  Predicted word: {next_word}\n")
+
+    return ' '.join(outputs)
+
     
 def visualize_results(df):
     st.subheader(" Model Comparison Results")
@@ -464,7 +608,14 @@ def visualize_results(df):
 
     # 3️⃣ Pairwise Model Comparisons
     st.write("### Pairwise Model Comparisons")
-    pairs = [("N-gram", "HLSTM"), ("N-gram", "Markov"), ("HLSTM", "Markov")]
+    pairs = [
+        ("N-gram", "HLSTM"),
+        ("N-gram", "Markov"),
+        ("HLSTM", "Markov"),
+        ("N-gram", "UniGram"),
+        ("UniGram", "Markov"),
+        ("HLSTM", "UniGram")
+    ]
     for a, b in pairs:
         subdf = df[df["Model"].isin([a, b])]
         fig4, ax4 = plt.subplots(figsize=(4, 2.5))
@@ -524,7 +675,7 @@ def main():
 
     page = st.sidebar.selectbox(
         "Choose a model",
-        ("HLSTM Model", "N-gram Model", "Markov Email Model", "Compare All Models")
+        ("HLSTM Model", "N-gram Model", "Markov Email Model","Uni Gram Model","GRU Model", "Compare All Models")
     )
 
     if page == "HLSTM Model":
@@ -554,6 +705,19 @@ def main():
                 predicted = predict_ngram_next_words(model, prev_sentence, curr_prefix, max_pred, debug=True)
                 st.markdown(f"**Predicted next words:** {predicted}")
 
+    elif page == "Uni Gram Model":
+        st.header("Uni-gram Next Word Prediction")
+        model = load_unigram_model()
+        prev_sentence = st.text_input("Previous sentence (context):", value="", key="ngram_prev")
+        curr_prefix = st.text_input("Current sentence prefix:", value="I have a", key="ngram_curr")
+        max_pred = st.slider("Number of words to predict:", 1, 10, 5, key="ngram_slider")
+        if st.button("Predict Uni-gram Next Words"):
+            if curr_prefix.strip() == '':
+                st.warning("Please enter a prefix sentence.")
+            else:
+                # Enable debug logs
+                predicted = predict_unigram_next_words(model, prev_sentence, curr_prefix, max_pred, debug=True)
+                st.markdown(f"**Predicted next words:** {predicted}")
 
     elif page == "Markov Email Model":
         st.header("Markov Next Word Prediction")
@@ -568,21 +732,53 @@ def main():
                 predicted = predict_markov_next_words(model, prev_sentence, curr_prefix, max_pred)
                 st.markdown(f"**Predicted next words:** {predicted}")
     
+    elif page == "GRU Model":
+        st.header("🧠 GRU Next Word Prediction")
+
+        try:
+            # Load model and mappings
+            gru_model, word_to_index, index_to_word, sequence_length = load_gru_model()
+
+            prev_sentence = st.text_input("Previous sentence (context):", value="", key="gru_prev")
+            curr_prefix = st.text_input("Current sentence prefix:", value="I have a", key="gru_curr")
+            max_pred = st.slider("Number of words to predict:", 1, 10, 5, key="gru_slider")
+
+            if st.button("🔮 Predict GRU Next Words"):
+                if not curr_prefix.strip():
+                    st.warning("Please enter a prefix sentence.")
+                else:
+                    try:
+                        predicted = predict_gru_next_words(
+                            gru_model,
+                            word_to_index,
+                            index_to_word,
+                            sequence_length,
+                            prev_sentence,
+                            curr_prefix,
+                            num_words=max_pred
+                        )
+                        st.markdown(f"**Predicted next words:** {predicted}")
+                    except Exception as e:
+                        st.error(f"⚠️ Error during prediction: {e}")
+
+        except Exception as e:
+            st.error(f"Model could not be loaded: {e}")
+        
     elif page == "Compare All Models":
-        st.header("Compare HLSTM, N-gram, and Markov Models")
+        st.header("Comparision of Models")
 
         # Load models
         hlstm_model, vocab = load_hlstm_model()
         ngram_model = load_ngram_model()
         markov_model = load_markov_model()
+        uni_gram = load_unigram_model()
 
         # Provide test samples (you can replace with your test corpus)
         st.write("Enter test sentences (one per line):")
         test_text = st.text_area("Test Data:", 
-            "I love learning new languages.\n"
-            "The weather today is really nice.\n"
-            "Machine learning models are powerful.\n"
-            "He wanted to buy a new laptop."
+            "Looking forward to the \n"
+            "Draft is quiet impressive i have\n"
+            "Meeting on saturday has been posponed to"
         )
         test_sentences = [s.strip() for s in test_text.split("\n") if s.strip()]
 
@@ -594,8 +790,11 @@ def main():
                 results.append(evaluate_model("HLSTM", predict_hlstm_next_words, hlstm_model, vocab, test_sentences, n_words))
                 results.append(evaluate_model("N-gram", predict_ngram_next_words, ngram_model, None, test_sentences, n_words))
                 results.append(evaluate_model("Markov", predict_markov_next_words, markov_model, None, test_sentences, n_words))
+                results.append(evaluate_model("UniGram", predict_unigram_next_words, uni_gram, None, test_sentences, n_words))
+                
             
                 df = pd.DataFrame([r for r in results if r])
+                print(df)
                 visualize_results(df)
 
 if __name__ == "__main__":
